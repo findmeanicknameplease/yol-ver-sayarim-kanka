@@ -11,6 +11,19 @@ from typing import List, Dict, Any, Tuple
 import numpy as np
 import gradio as gr
 
+
+import os
+import warnings
+
+# Silence noisy tokenizer warnings coming from the reranker tokenizer plumbing
+warnings.filterwarnings("ignore", message=r"You're using a Qwen2TokenizerFast tokenizer.*")
+warnings.filterwarnings("ignore", message=r"`max_length` is ignored when `padding`=`True`.*")
+
+try:
+    from transformers.utils import logging as hf_logging  # type: ignore
+    hf_logging.set_verbosity_error()
+except Exception:
+    pass
 # Local modules
 from priors import parse_query_intent, compute_prior_score
 from offline_store import OfflineStore
@@ -45,6 +58,16 @@ store = OfflineStore(DB_PATH, FRAMES_FAISS, TX_FAISS, dim=DIM)
 embedder = Qwen3VLEmbedder(model_name_or_path="Qwen/Qwen3-VL-Embedding-2B")
 
 
+
+
+# Reranker is heavy; initialize lazily once (first time user toggles it)
+_reranker = None
+
+def get_reranker():
+    global _reranker
+    if _reranker is None:
+        _reranker = Qwen3VLReranker(model_name_or_path="Qwen/Qwen3-VL-Reranker-2B")
+    return _reranker
 def _to_numpy(x) -> np.ndarray:
     if hasattr(x, "detach"):
         return x.detach().cpu().numpy()
@@ -123,28 +146,41 @@ def search(q: str, topk: int, use_rerank: bool):
     # 4. Final Sort (incorporating priors)
     rows.sort(key=lambda x: x["final_score"], reverse=True)
 
-    # 5. Optional reranker on top N only (expensive)
-    if use_rerank and HAS_RERANKER and rows:
-        reranker = Qwen3VLReranker(model_name_or_path="Qwen/Qwen3-VL-Reranker-2B")
-        N = min(12, len(rows))
+    
+# 5. Optional reranker on top N only (expensive)
+# IMPORTANT: If reranker is enabled, treat rerank_score as the final ordering signal for the top-N.
+# We keep priors for thresholding + tie-breaks, but we DO NOT mix rerank_score into the embedding threshold.
+if use_rerank and HAS_RERANKER and rows:
+    reranker = get_reranker()
+    N = min(12, len(rows))
 
-        docs = []
-        for r in rows[:N]:
-            docs.append({"image": r["path"], "text": r.get("name") or ""})
+    # Build reranker docs from the current top-N (already sorted by priors)
+    docs = [{"image": r["path"], "text": r.get("name") or ""} for r in rows[:N]]
 
-        inputs = {
-            "instruction": INSTRUCTION,
-            "query": {"text": q},
-            "documents": docs,
-            "fps": 1.0,
-            "max_frames": 64,
-        }
-        scores = reranker.process(inputs)
-        for i, s in enumerate(scores):
-            rows[i]["rerank_score"] = float(s)
+    inputs = {
+        "instruction": INSTRUCTION,
+        "query": {"text": q},
+        "documents": docs,
+        "fps": 1.0,
+        "max_frames": 64,
+    }
 
-        # If reranker run, sort top N by rerank score
-        rows[:N] = sorted(rows[:N], key=lambda x: x.get("rerank_score", -1e9), reverse=True)
+    # Some wrappers return torch tensors / lists; coerce to python floats
+    scores = reranker.process(inputs)
+    try:
+        scores = list(scores)
+    except Exception:
+        pass
+
+    for i, s in enumerate(scores[:N]):
+        rows[i]["rerank_score"] = float(_to_numpy(s) if hasattr(s, "detach") else s)
+
+    # Final: sort top-N by rerank score first, then prior-adjusted score as tie-breaker
+    rows[:N] = sorted(
+        rows[:N],
+        key=lambda x: (x.get("rerank_score", -1e9), x.get("final_score", x.get("score", 0.0))),
+        reverse=True,
+    )
 
     gallery = []
     debug_lines = []
@@ -156,6 +192,7 @@ def search(q: str, topk: int, use_rerank: bool):
         f"Query: {q}\n"
         f"Intent: {intent}\n"
         f"Raw best score: {best:.3f}\n"
+        + (f"Best rerank (topN): {max([r.get('rerank_score', -1e9) for r in rows[:min(12,len(rows))]]):.3f}\n" if (use_rerank and HAS_RERANKER and any(r.get("rerank_score") is not None for r in rows[:min(12,len(rows))])) else "")
         f"Threshold used: {keep_min:.3f} (MIN_SCORE={MIN_SCORE}, KEEP_RATIO={KEEP_RATIO})\n\n"
         + "\n".join(debug_lines)
     )
